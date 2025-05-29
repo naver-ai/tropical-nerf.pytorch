@@ -278,78 +278,96 @@ def subpoly_(vertices, edges, net, l, h, eps, outputs_=None, pruning=True, stric
 
     return vertices, edges, outputs_
 
-
-def regions_to_vertices(m: Tensor, offset: Tensor = None, return_inverse=False,
-                        debug=False) -> Dict:
-    """Calculate the map from regions to vertices. It requires little more memory
-        to keep 2^3 variants but it does not need unique keys for each region.
-
+def regions_to_vertices(m: Tensor, offset: Optional[Tensor] = None, return_inverse: bool = False, debug: bool = False) -> Tuple[Tensor, Tensor]:
+    """
+    Calculate the map from regions to vertices.
     Args:
         m (Tensor): The mask indicating regions in [-1, 0, +1]^(V x (L x H)), while
                     [0, +1]^(V x D) for grid-based encodings along with `offset`.
         offset (Tensor, optional): A region offset for grid-based encodings.
 
     Returns:
-        Dict: Regions to vertices
+        Tuple[Tensor, Tensor]:
+        r_idx: (M,) each augmented row’s region ID
+        idx_org: (M,) original row index
     """
-    rv = {}
+    if m.numel() == 0:
+        return torch.empty(0, dtype=torch.long, device=m.device), torch.empty(0, dtype=torch.long, device=m.device)
 
-    # integer to left-aligned binary
-    def _torbin(x): return [x % 2] + _torbin(x//2) if x > 1 else [x]
+    #t0 = time.time()
+    # count zeros per original row
+    k = (m == 0).sum(dim=1)
+    k_uniq = torch.unique(k)
+    D_sign = m.shape[1] # Dimension of sign pattern
+    D = offset.shape[1] # Dimension of offset
 
-    # fill zeros with fixed size
-    def torbin(x, place=2):
-        y = _torbin(x)
-        y += [0] * (place - len(y)) if place > len(y) else []
-        return y
+    # group rows by zero-count > 0
+    groups = {}
+    for ki in k_uniq:
+        groups[int(ki)] = (k == ki).nonzero(as_tuple=True)[0]
 
-    if 0 == m.shape[0]:
-        return rv
+    m_aug, idx_org = [], []
 
-    k = (m == 0).sum(dim=1, keepdim=True)  # the number of planes on which a point lies
-    dim = k.max().item()  # the maximum number of planes, caution: numerical instability
-    mm = []  # mask holding variants
+    # per-zero-count augment and record original row index
+    for ki, rows in groups.items():
+        G = rows.numel()
+        dim = 2 ** ki
 
-    if 0 < dim:  # need to consider variants
-        if debug:
-            t = time.time()
-        for i in range(2 ** dim):
-            s = m.new_tensor(torbin(i, dim)).unsqueeze(0).repeat(m.shape[0], 1)
-            a = torch.arange(dim, device=m.device).unsqueeze(0).repeat(m.shape[0], 1)
-            s = s * 2 - 1  # binary to [-1, +1]
-            s = s[a < k]  # some samples may have extra zeros due to a numerical issue
-            mm += [m.masked_scatter(m == 0, s)]
+        # build 2^ki (+1, -1) sign‐patterns
+        patterns = torch.cartesian_prod(*([m.new_tensor([-1, 1])] * ki))
 
-        # concat in this way to index
-        m = torch.cat(mm, dim=-1).view(-1, m.shape[-1])
-        if debug:
-            print(f"  - build 8 variants took {t - time.time():.3f}s")
+        # select group‐rows and build 2^dim replicas
+        m_grp = m[rows] # (G, D_sign)
+        m_rep = m_grp.unsqueeze(1).expand(G, dim, D_sign).reshape(-1, D_sign).clone() # must clone: reshape after expand may return a view
 
-        if offset is not None and 0 < m.shape[0]:
-            D = offset.shape[1]
-            m[:, :D] = (m[:, :D] - 1) // 2
-            m[:, :D] += offset.repeat(1, 2 ** dim).view(-1, D)
+        # fill zero with sign patterns
+        zero_mask = (m_rep == 0)
+        m_rep[zero_mask] = patterns.repeat(G, 1).flatten()
 
-    # build a dict to map regions to belonging vertices
-    if debug:
-        t = time.time()
-    _, r_idx = m.unique(dim=0, return_inverse=True)
-    if debug:
-        print(f"  - unique took {t - time.time():.3f}s")
+        # offset part
+        if offset is not None:
+            # select group‐rows and build 2^dim replicas
+            off_grp = offset[rows] # (G, D)
+            off_rep = off_grp.unsqueeze(1).expand(G, dim, D).reshape(-1, D)
+            m_rep[:, :D] = (m_rep[:, :D] - 1)//2 + off_rep
 
-    if return_inverse:
-        return r_idx, dim
+        m_aug.append(m_rep)
+        idx_org.append(rows.unsqueeze(1).expand(G, dim).reshape(-1))
 
-    if debug:
-        t = time.time()
-    for i in range(r_idx.shape[0]):
-        k = r_idx[i].item()
-        v = i // 2 ** dim
-        rv[k] = rv.get(k, []) + ([v] if v not in rv.get(k, []) else [])
-    if debug:
-        print(f"  - build the rv map took {t - time.time():.3f}s")
-    return rv
+    m_aug = torch.cat(m_aug, dim=0)
+    idx_org = torch.cat(idx_org, dim=0)
+    _, r_idx = m_aug.unique(dim=0, return_inverse=True)
+    return r_idx, idx_org
 
+def r_idx_as_tensor(r_idx: Tensor, idx_org: Tensor, tensor: Tensor, null_value: int = -1) -> Tensor:
+    """Make a index tensor (Region) x (A left-aligned list of vertex indices)
+    using `masked_scatter`. Caution: duplicated elements.
+
+    Args:
+        r_idx (Tensor): The region indices for where vertices belongs to
+        idx_org (Tensor): The index map for augmented vertices to original vertices
+        tensor (Tensor): To get the current working dtype and device
+        null_value (TYPE, optional): Masking value
+
+    Returns:
+        Tensor: Left-aligned region x a list of vertex indices
+    """
+    #t = time.time()
+    indices = torch.stack([r_idx, idx_org], dim=1)
+    indices = indices[indices[:,0].argsort()]
+    rgn_uniq, counts = torch.unique(indices[:,0], return_counts=True)
+    R = rgn_uniq.numel()
+    max_len = counts.max().item()
+
+    out = torch.full((R, max_len), null_value, dtype=tensor.dtype, device=tensor.device)
+
+    mask = (torch.arange(max_len, device=tensor.device).unsqueeze(0).expand(R, max_len)
+        < counts.unsqueeze(1)
+    )
+    out.masked_scatter_(mask, indices[:,1])
+
+    #print(f"runtime for r_idx_as_tensor took {time.time()-t:.3f}s")
+    return out
 
 @deprecated
 def edge_vertices_v1(vertices: Tensor, m: Tensor, offset: Tensor = None) -> Tensor:
@@ -479,8 +497,9 @@ def edge_vertices(vertices: Tensor, m: Tensor, net: Module, offset: Tensor = Non
         Tensor: Edges with vertex indices (V'x2)
     """
     # Find regions
-    r_idx, dim = regions_to_vertices(m, offset, return_inverse=True)
-    v_indices = r_idx_as_tensor(r_idx, dim, offset)
+    r_idx, aug = regions_to_vertices(m, offset, return_inverse=True)
+    v_indices = r_idx_as_tensor(r_idx, aug, offset)
+
     counts = (v_indices != -1).sum(dim=1)
 
     def extract_every_valid_edge(input_tensor, C):  # remove inner-loop
@@ -494,6 +513,7 @@ def edge_vertices(vertices: Tensor, m: Tensor, net: Module, offset: Tensor = Non
         return torch.cat(out, dim=0)
 
     # Extract every edge
+    t = time.time()
     output = extract_every_valid_edge(v_indices, counts.max())
     output = output.unique(dim=0)
 
@@ -511,6 +531,7 @@ def edge_vertices(vertices: Tensor, m: Tensor, net: Module, offset: Tensor = Non
         (chk1[:, 0, :D] * chk1[:, 1, :D]) * (chk2[:, 0] - chk2[:, 1]) != 0).sum(dim=-1)
 
     output = output[zero_counts >= 1]  # except the current plane, so >= 1.
+    #print(f"construct edges took {time.time() - t:.3f}s")
     return output
 
 
@@ -587,15 +608,13 @@ def extract_faces(vertices: Tensor, edges: Tensor, net: Module, outputs: Tensor 
 
     if DEBUG:
         t = time.time()
-    # r2v = regions_to_vertices(m_rgn[:, :-1], offset)
-    r_idx, dim = regions_to_vertices(m_rgn[:, :-1], offset, return_inverse=True)
+    r_idx, aug = regions_to_vertices(m_rgn[:, :-1], offset, return_inverse=True)
     if DEBUG:
         print(f"- regions_to_vertices took {time.time() - t:.3f}")
 
     if DEBUG:
         t = time.time()
-    # v_indices = regions_to_vertices_as_tensor(r2v).to(edges.device)
-    v_indices = r_idx_as_tensor(r_idx, dim, edges)
+    v_indices = r_idx_as_tensor(r_idx, aug, edges)
 
     # deduplication
     v_indices = v_indices.unique(dim=0)
@@ -646,49 +665,6 @@ def regions_to_vertices_as_tensor(data_dict, null_value=-1):
 
     # Convert the list of lists into a PyTorch tensor
     return torch.tensor(padded_values)
-
-
-def r_idx_as_tensor(r_idx: Tensor, dim: int, tensor: Tensor, null_value=-1) \
-        -> Tensor:
-    """Make a index tensor (Region) x (A left-aligned list of vertex indices)
-        using `masked_scatter`. Caution: duplicated elements.
-
-    Args:
-        r_idx (Tensor): The region indices for where vertices belongs to
-        dim (int): The maximum hyperplane-intersection counts (usually 3)
-        tensor (Tensor): To get the current working dtype and device
-        null_value (TYPE, optional): Masking value
-
-    Returns:
-        Tensor: Left-aligned region x a list of vertex indices
-    """
-    # Get unique values and counts
-    unique_values, counts = torch.unique(r_idx, return_counts=True)
-
-    # Determine the maximum length of the lists (max # of vertices per polygon)
-    max_length = counts.max()
-
-    # Create the output tensor with the specified null value
-    output = torch.full((r_idx.max() + 1, max_length), null_value,
-                        dtype=tensor.dtype, device=tensor.device)
-
-    # Calculate indices and fill the output tensor.
-    # Vertex indices are not sorted although it doesn't matter
-    # since we will sort the vertices using normal to define a polygon.
-    indices = torch.stack(
-        [r_idx, torch.arange(r_idx.shape[0], device=r_idx.device)], dim=1)
-    indices = indices[indices[:, 0].sort()[1]]
-
-    # Find the original vertex indices
-    indices[:, 1] //= 2 ** dim
-
-    # Efficient updating using counts
-    mask = torch.arange(max_length, dtype=tensor.dtype, device=tensor.device
-                        ).unsqueeze(0).repeat(output.size(0), 1) < counts.unsqueeze(1)
-    output.masked_scatter_(mask, indices[:, 1])
-
-    return output
-
 
 def mean_points_with_valid(vertices, v_indices, dim=1, null_value=-1,
                            return_points=False):
